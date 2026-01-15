@@ -28,7 +28,7 @@ class NatsStorage(BaseStorage):
     ) -> None:
 
         if key_builder is None:
-            key_builder = DefaultKeyBuilder()
+            key_builder = DefaultKeyBuilder(separator=".")
         self.nc = nc
         self.js = js
         self.fsm_states_bucket = fsm_states_bucket
