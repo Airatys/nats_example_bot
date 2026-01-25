@@ -1,62 +1,122 @@
 import asyncio
-from asyncio import CancelledError
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
-import nats
-from nats.aio.msg import Msg
+import aiormq
+from aiormq.abc import DeliveredMessage
 
 
-# Функция-обработчик полученных сообщений
-async def on_message(msg: Msg):
-    # Получаем из заголовков сообщения время отправки и время задержки
-    sent_time = datetime.fromtimestamp(float(msg.headers.get('Tg-Delayed-Msg-Timestamp')), tz=timezone.utc)
-    delay = int(msg.headers.get('Tg-Delayed-Msg-Delay'))
+async def on_message(message: DeliveredMessage):
+    try:
+        # Получаем заголовки сообщения
+        headers = message.header.properties.headers
 
-    # Проверяем наступило ли время обработки сообщения
-    if sent_time + timedelta(seconds=delay) > datetime.now().astimezone():
-        # Если время обработки не наступило - вычисляем сколько секунд осталось до обработки
-        new_delay = (sent_time + timedelta(seconds=delay) - datetime.now().astimezone()).total_seconds()
-        # Отправляем nak с временем задержки
-        await msg.nak(delay=new_delay)
-    else:
-        # Если время обработки наступило - выводим информацию в консоль
-        subject = msg.subject
-        data = msg.data.decode()
-        print(f"Received message '{data}' from subject `{subject}`")
-        await msg.ack()
+        # Получаем время, когда сообщение требует обработки
+        scheduled_time = datetime.fromisoformat(headers.get('scheduled_time')).astimezone(timezone.utc)
+
+        # Получаем текущее время
+        current_time = datetime.now(timezone.utc)
+
+        # Сравниваем текущее время со временем из сообщения
+        if current_time >= scheduled_time:
+            print(f"Processing message: {message.body.decode()}")
+
+            # Эмулируем обработку сообщения
+            await asyncio.sleep(1)
+
+            # Отправляем подтверждение брокеру
+            await message.channel.basic_ack(delivery_tag=message.delivery.delivery_tag)
+        else:
+
+            # Считаем время до обработки в миллисекундах
+            delay = int((scheduled_time - current_time).total_seconds() * 1000)
+            print(f"Deferring message: {message.body.decode()}, delay: {delay} ms")
+
+            # Публикуем сообщение в `delayed_exchange` с заданной задержкой
+            await message.channel.basic_publish(
+                body=message.body,
+                routing_key='main_queue',
+                exchange='delayed_exchange',
+                properties=aiormq.spec.Basic.Properties(
+                    headers={
+                        'x-delay': delay,
+                        'scheduled_time': scheduled_time.isoformat()
+                    }
+                ),
+            )
+
+            # Отклоненяем сообщение без повторной отправки в основную очередь
+            await message.channel.basic_reject(delivery_tag=message.delivery.delivery_tag, requeue=False)
+    except Exception as e:
+        print(f"Failed to process message: {e}")
+
+        # Отправляем брокеру сообщение о неудачной обработке
+        await message.channel.basic_nack(delivery_tag=message.delivery.delivery_tag, requeue=True)
+
+
+async def consume(channel):
+    # Настраиваем консьюмер на прослушивание `main_queue` очереди
+    await channel.basic_consume('main_queue', on_message, no_ack=False)
+
+
+async def create_channel(connection):
+    # Создаем канал
+    channel = await connection.channel()
+
+    # Объявляем точку обмена для отложенных сообщений
+    await channel.exchange_declare(
+        "delayed_exchange",
+        exchange_type="x-delayed-message",
+        arguments={"x-delayed-type": "direct"}
+    )
+
+    # Объявляем очередь
+    await channel.queue_declare('main_queue')
+
+    # Привязываем очередь к обменнику `main_exchange`
+    await channel.queue_bind('main_queue', 'main_exchange', routing_key='main_routing_key')
+
+    # Привязываем очередь к обменнику `delayed_exchange`
+    await channel.queue_bind('main_queue', 'delayed_exchange', routing_key='main_queue')
+
+    # Определяем качество сервися (консьюмер будет получать по одному сообщению за один раз)
+    await channel.basic_qos(prefetch_count=1)
+
+    # Возвращаем созданный и настроенный канал
+    return channel
 
 
 async def main():
-    # Подключаемся к NATS серверу
-    nc = await nats.connect("nats://127.0.0.1:4222")
-    # Получаем JetStream-контекст
-    js = nc.jetstream()
+    # Указываем параметры соединения с брокером
+    connection_params = "amqp://rabbitmqlogin:rabbitmqpassword@localhost/"
 
-    # Сабджект для подписки
-    subject = "aiogram.delayed.messages"
+    # Запускаем бесконечный цикл попыток соединения с брокером
+    while True:
+        try:
+            # Подключаемся к брокеру
+            connection = await aiormq.connect(connection_params)
 
-    # Стрим для подписки
-    stream = 'delayed_messages_aiogram'
+            # Создаем канал
+            channel = await create_channel(connection)
 
-    # Подписываемся на указанный стрим
-    await js.subscribe(
-        subject=subject,
-        stream=stream,
-        cb=on_message,
-        durable='delayed_messages_consumer',
-        manual_ack=True
-    )
+            # Запускаем прослушивание очереди
+            await consume(channel)
 
-    print(f"Subscribed to subject '{subject}'")
+            # Запускаем фоновую задачу для отслеживания состояния соединения
+            async with connection:
+                while not connection.is_closed:
+                    await asyncio.sleep(1)
 
-    # Создаем future для поддержания соединения открытым
-    try:
-        await asyncio.Future()
-    except CancelledError:
-        pass
-    finally:
-        # Закрываем соединение
-        await nc.close()
+        except aiormq.exceptions.AMQPConnectionError as e:
+            print(f"Connection error: {e}")
+
+            # Ожидаем перед повторной попыткой соединения
+            await asyncio.sleep(5)
+
+        except Exception as e:
+            print(f"Unexpected error: {e}")
+
+            # Ожидаем перед повторной попыткой соединения
+            await asyncio.sleep(5)
 
 
 asyncio.run(main())

@@ -1,36 +1,44 @@
 import asyncio
-from datetime import datetime
+import json
+from datetime import datetime, timedelta, timezone
 
-import nats
+import aiormq
 
 
-async def main():
-    # Подключаемся к серверу NATS
-    nc = await nats.connect("nats://127.0.0.1:4222")
+async def publish_message():
+    # Подключаемся к RabbitMQ
+    connection = await aiormq.connect('amqp://rabbitmqlogin:rabbitmqpassword@localhost/')
 
-    # Желаемая задержка в секундах
-    delay = 5
+    # Создаем канал
+    channel = await connection.channel()
 
-    # Сообщение для отправки
-    message = 'Hello from Python-publisher!'
+    # Объявляем точку обмена (создается, если не существует)
+    await channel.exchange_declare('main_exchange', exchange_type='direct')
 
-    # Заголовки
-    headers = {
-        'Tg-Delayed-Msg-Timestamp': str(datetime.now().timestamp()),
-        'Tg-Delayed-Msg-Delay': str(delay)
+    # Определяем время, когда сообщение должно быть обработано
+    scheduled_time = (datetime.now(timezone.utc) + timedelta(seconds=5)).isoformat()
+
+    # Создаем словарь, из которого будет сформировано тело сообщения
+    body = {
+        'text': 'Привет из RabbitMQ!',
     }
 
-    # Сабджект, в который отправляется сообщение
-    subject = 'aiogram.delayed.messages'
+    # Отправляем сообщение в `main_exchange`
+    await channel.basic_publish(
+        body=json.dumps(body).encode('utf-8'),
+        exchange='main_exchange',
+        routing_key='main_routing_key',
+        properties=aiormq.spec.Basic.Properties(
+            headers={
+                'scheduled_time': scheduled_time
+            }
+        )
+    )
 
-    # Публикуем сообщение на указанный сабджект
-    await nc.publish(subject, message.encode(encoding='utf-8'), headers=headers)
-
-    # Выводим в консоль информацию о том, что сообщение опубликовано
-    print(f"Message '{message}' with headers {headers} published in subject `{subject}`")
+    print(f'Published message with scheduled time: {scheduled_time}')
 
     # Закрываем соединение
-    await nc.close()
+    await connection.close()
 
 
-asyncio.run(main())
+asyncio.run(publish_message())
